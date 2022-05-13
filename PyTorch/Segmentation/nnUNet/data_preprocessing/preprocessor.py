@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,6 +53,12 @@ class Preprocessor:
             dataset_json["val"] = dataset_json["training"]
             with open(metadata_path, "w") as outfile:
                 json.dump(dataset_json, outfile)
+#         landmarks = tio.HistogramStandardization.train(
+#             self.metadata[self.args.exec_mode]['image'],
+#             output_path='landmarks.npy',
+#         )
+#         landmarks_dict = {'image': landmarks}
+#         self.histogram_transform = tio.HistogramStandardization(landmarks_dict)
 
     def run(self):
         make_empty_dir(self.results)
@@ -63,7 +69,7 @@ class Preprocessor:
             self.collect_spacings()
         if self.verbose:
             print(f"Target spacing {self.target_spacing}")
-
+        
         if self.modality == "CT":
             try:
                 self.ct_min = ct_min[self.task]
@@ -79,7 +85,8 @@ class Preprocessor:
                 print(f"[CT] min: {self.ct_min}, max: {self.ct_max}, mean: {_mean}, std: {_std}")
 
         self.run_parallel(self.preprocess_pair, self.args.exec_mode)
-
+#         print('config')
+#         print(self.target_spacing)
         pickle.dump(
             {
                 "patch_size": self.patch_size,
@@ -93,24 +100,31 @@ class Preprocessor:
     def preprocess_pair(self, pair):
         fname = os.path.basename(pair["image"] if isinstance(pair, dict) else pair)
         image, label, image_spacings = self.load_pair(pair)
-
+        print(image.shape)
+#         print(image_spacings)
         # Crop foreground and store original shapes.
         orig_shape = image.shape[1:]
+        print(orig_shape)
         bbox = transforms.utils.generate_spatial_bounding_box(image)
         image = transforms.SpatialCrop(roi_start=bbox[0], roi_end=bbox[1])(image)
+        print(image.shape)
         image_metadata = np.vstack([bbox, orig_shape, image.shape[1:]])
+        print(image_metadata)
         if label is not None:
             label = transforms.SpatialCrop(roi_start=bbox[0], roi_end=bbox[1])(label)
+#             print(label.shape)
             self.save_npy(label, fname, "_orig_lbl.npy")
 
-        if self.args.dim == 3:
-            image, label = self.resample(image, label, image_spacings)
+#         if self.args.dim == 3:
+#             image, label = self.resample(image, label, image_spacings)
         if self.modality == "CT":
             image = np.clip(image, self.ct_min, self.ct_max)
-        image = self.normalize(image)
+#         image = self.normalize(image)
+#         image = self.histogram_transform(image)
         if self.training:
             image, label = self.standardize(image, label)
-
+#         print('after_stand')
+#         print(image.shape)
         if self.args.ohe:
             mask = np.ones(image.shape[1:], dtype=np.float32)
             for i in range(image.shape[0]):
@@ -119,10 +133,10 @@ class Preprocessor:
             image = self.normalize_intensity(image).astype(np.float32)
             mask = np.expand_dims(mask, 0)
             image = np.concatenate([image, mask])
-
         self.save(image, label, fname, image_metadata)
 
     def resample(self, image, label, image_spacings):
+        print(image_spacings), print( self.target_spacing)
         if self.target_spacing != image_spacings:
             image, label = self.resample_pair(image, label, image_spacings)
         return image, label

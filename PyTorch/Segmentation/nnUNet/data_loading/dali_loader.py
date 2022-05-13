@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 
 import itertools
 import os
+from functools import partial
+from multiprocessing import Pool
 
 import numpy as np
 import nvidia.dali.fn as fn
@@ -22,6 +24,7 @@ import nvidia.dali.ops as ops
 import nvidia.dali.types as types
 from nvidia.dali.pipeline import Pipeline
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
+from utils.utils import print0
 
 
 def random_augmentation(probability, augmented, original):
@@ -39,7 +42,10 @@ class GenericPipeline(Pipeline):
         self.patch_size = kwargs["patch_size"]
         self.load_to_gpu = kwargs["load_to_gpu"]
         self.input_x = self.get_reader(kwargs["imgs"])
-        self.input_y = self.get_reader(kwargs["lbls"]) if kwargs["lbls"] is not None else None
+        if kwargs["lbls"] is not None:
+            self.input_y = self.get_reader(kwargs["lbls"]) 
+        else:
+            self.input_y = None
 
     def get_reader(self, data):
         return ops.readers.Numpy(
@@ -146,12 +152,13 @@ class TrainPipeline(GenericPipeline):
     def define_graph(self):
         img, lbl = self.load_data()
         img, lbl = self.biased_crop_fn(img, lbl)
-        img, lbl = self.zoom_fn(img, lbl)
-        img, lbl = self.flips_fn(img, lbl)
-        img = self.noise_fn(img)
-        img = self.blur_fn(img)
-        img = self.brightness_fn(img)
-        img = self.contrast_fn(img)
+        if self.aug:
+            img, lbl = self.zoom_fn(img, lbl)
+            img, lbl = self.flips_fn(img, lbl)
+            img = self.noise_fn(img)
+            img = self.blur_fn(img)
+            img = self.brightness_fn(img)
+            img = self.contrast_fn(img)
         if self.dim == 2:
             img, lbl = self.transpose_fn(img, lbl)
         return img, lbl
@@ -229,14 +236,12 @@ def fetch_dali_loader(imgs, lbls, batch_size, mode, **kwargs):
     assert len(imgs) > 0, "Empty list of images!"
     if lbls is not None:
         assert len(imgs) == len(lbls), f"Number of images ({len(imgs)}) not matching number of labels ({len(lbls)})"
-
     if kwargs["benchmark"]:  # Just to make sure the number of examples is large enough for benchmark run.
         batches = kwargs["test_batches"] if mode == "test" else kwargs["train_batches"]
         examples = batches * batch_size * kwargs["gpus"]
         imgs = list(itertools.chain(*(100 * [imgs])))[:examples]
         lbls = list(itertools.chain(*(100 * [lbls])))[:examples]
         mode = "benchmark"
-
     pipeline = PIPELINES[mode]
     shuffle = True if mode == "train" else False
     dynamic_shape = True if mode in ["eval", "test"] else False
@@ -244,12 +249,22 @@ def fetch_dali_loader(imgs, lbls, batch_size, mode, **kwargs):
     pipe_kwargs = {"imgs": imgs, "lbls": lbls, "load_to_gpu": load_to_gpu, "shuffle": shuffle, **kwargs}
     output_map = ["image", "meta"] if mode == "test" else ["image", "label"]
 
+    rank = int(os.getenv("LOCAL_RANK", "0"))
+    if mode == "eval":  # To avoid padding for the multi-gpu evaluation.
+        if kwargs["invert_resampled_y"]:
+            assert len(kwargs["orig_lbl"]) == len(imgs), f"""{len(kwargs["orig_lbl"])}, {len(imgs)}"""
+            output_map.extend(["meta", "orig_lbl"])
+            meta, orig = kwargs["meta"], kwargs["orig_lbl"]
+        else:
+            meta, orig = None, None
+        imgs, lbls, meta, orig = shard_val_data(
+            imgs, lbls, meta, orig, kwargs["gpus"], kwargs["patch_size"], kwargs["overlap"]
+        )
+
     if kwargs["dim"] == 2 and mode in ["train", "benchmark"]:
         batch_size_2d = batch_size // kwargs["nvol"] if mode == "train" else batch_size
         batch_size = kwargs["nvol"] if mode == "train" else 1
         pipe_kwargs.update({"patch_size": [batch_size_2d] + kwargs["patch_size"]})
-
-    rank = int(os.getenv("LOCAL_RANK", "0"))
     pipe = pipeline(batch_size, kwargs["num_workers"], rank, **pipe_kwargs)
     return LightningWrapper(
         pipe,
@@ -258,3 +273,43 @@ def fetch_dali_loader(imgs, lbls, batch_size, mode, **kwargs):
         output_map=output_map,
         dynamic_shape=dynamic_shape,
     )
+
+
+def calculate_inference_cost(img, intervals):
+    shapes = list(np.load(img).shape[1:])
+    cost = np.prod([(s + i - 1) // i for s, i in zip(shapes, intervals)])
+    return cost
+
+
+def shard_val_data(imgs, lbls, meta, orig, gpus, patch_size, overlap):
+    if gpus == 1:
+        return imgs, lbls, meta, orig
+
+    rank = int(os.getenv("LOCAL_RANK", "0"))
+    intervals = [d * overlap for d in patch_size]
+    print0("Balancing evaluation mode...")
+    pool = Pool(processes=8)
+    work = np.array(pool.map(partial(calculate_inference_cost, intervals=intervals), lbls))
+
+    sort_idx = np.argsort(work)[::-1]
+    imgs, lbls = np.array(imgs), np.array(lbls)
+    work = work[sort_idx]
+    imgs, lbls = imgs[sort_idx], lbls[sort_idx]
+    if meta is not None:
+        meta, orig = np.array(meta), np.array(orig)
+        meta, orig = meta[sort_idx], orig[sort_idx]
+
+    imgs_balanced, lbls_balanced, meta_balanced, orig_balanced = ([[]] * gpus,) * 4
+    curr_work_per_shard = np.zeros((gpus,))
+
+    for w_idx, w in enumerate(work):
+        idx = np.argmin(curr_work_per_shard)
+        curr_work_per_shard[idx] += w
+        imgs_balanced[idx].append(imgs[w_idx])
+        lbls_balanced[idx].append(lbls[w_idx])
+        if meta is not None:
+            meta_balanced[idx].append(meta[w_idx])
+            orig_balanced[idx].append(orig[w_idx])
+
+    print("Done!")
+    return imgs_balanced[rank], lbls_balanced[rank], meta_balanced[rank], orig_balanced[rank]
